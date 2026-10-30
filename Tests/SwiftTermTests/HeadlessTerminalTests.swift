@@ -76,13 +76,13 @@ final class HeadlessTerminalTests {
         let reference = Locked<HeadlessTerminal?>(headless)
         let titleSequence = Array("\u{1b}]2;blocked title\u{7}".utf8)
 
-        DispatchQueue.global().async {
+        DispatchQueue(label: "final parse").async {
             let headless = reference.withLock { $0 }
             headless?.dataReceived(slice: titleSequence[...])
         }
         #expect(delegate.entered.wait(timeout: .now() + 2) == .success)
 
-        DispatchQueue.global().async {
+        DispatchQueue(label: "termination").async {
             terminationAttempted.signal()
             guard let headless = reference.withLock({ $0 }) else { return }
             headless.processTerminated(headless.process, exitCode: 0)
