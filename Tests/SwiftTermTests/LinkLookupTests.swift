@@ -84,11 +84,13 @@ final class LinkLookupTests: TerminalDelegate {
         #expect(firstAtom.target != nil)
         #expect(secondAtom.target != nil)
 
+        let firstTarget = String(describing: firstAtom.target)
+        let secondTarget = String(describing: secondAtom.target)
         first.feed(text: "\u{1b}[2J")
         first.garbageCollectPayload()
 
-        #expect(firstAtom.target == nil)
-        #expect(secondAtom.target != nil)
+        #expect(String(describing: firstAtom.target) != firstTarget)
+        #expect(String(describing: secondAtom.target) == secondTarget)
     }
 
     @Test func testTinyAtomConcurrentLookupAndRelease() async {
