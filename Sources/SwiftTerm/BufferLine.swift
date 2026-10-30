@@ -151,11 +151,24 @@ public final class BufferLine: CustomDebugStringConvertible {
         if end > usedLength { usedLength = min(end, storage.count) }
     }
 
+#if DEBUG
+    /// `SWIFTTERM_EXPENSIVE_ASSERTS=1` turns on checks that walk a whole row
+    /// on every recycle. They made a debug build parse `yes` several times
+    /// slower, so a debug host stalled on output. CI runs the tests with them.
+    static let expensiveAssertsEnabled: Bool = {
+#if SWIFTTERM_EMBEDDED
+        return false
+#else
+        return ProcessInfo.processInfo.environment["SWIFTTERM_EXPENSIVE_ASSERTS"] == "1"
+#endif
+    }()
+#endif
+
     /// Checks the ``usedLength`` invariant against the stored cells.
     @inline(__always)
     private func assertTailIsBlank () {
         #if DEBUG
-        guard usedLength < storage.count else { return }
+        guard BufferLine.expensiveAssertsEnabled, usedLength < storage.count else { return }
         for i in usedLength..<storage.count {
             assert(storage.rawCell(at: i) == tailBlankCell,
                    "BufferLine.usedLength invariant failed at cell \(i) of \(storage.count) " +
@@ -385,12 +398,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         let source = bytes.span
             .extracting(droppingFirst: sourceStart - bytes.startIndex)
             .extracting(first: count)
-        for offset in source.indices {
-            let rawValue = template |
-                (UInt64(source[offset]) << PackedCell.contentShift)
-            storage.setRawCell(PackedCell(rawValue: rawValue),
-                               at: destinationStart + offset)
-        }
+        storage.setPackedAsciiRun(source, template: template, at: destinationStart)
         noteWritten(upTo: destinationEnd)
         bump()
     }
