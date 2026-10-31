@@ -1512,23 +1512,21 @@ extension TerminalView {
         feedSender.configure(
             feedBytes: { bytes in
                 signal.markDirty()
-                let parse = Profiling.begin(.ioParse, "bytes=%d", bytes.count)
-                _ = owner.feed(bytes: bytes[...])
-                parse.end()
+                let outcome = owner.feed(bytes: bytes[...], afterHold: signal.markDirty)
                 diagnosticsState.withLock { diagnostics in
                     diagnostics.bytesFed += bytes.count
                     diagnostics.batches += 1
+                    diagnostics.feedHandoffs += outcome?.handoffs ?? 0
                 }
-                signal.markDirty()
             },
             feedText: { text in
                 signal.markDirty()
-                _ = owner.feed(text: text)
+                let outcome = owner.feed(text: text, afterHold: signal.markDirty)
                 diagnosticsState.withLock { diagnostics in
                     diagnostics.bytesFed += text.utf8.count
                     diagnostics.batches += 1
+                    diagnostics.feedHandoffs += outcome?.handoffs ?? 0
                 }
-                signal.markDirty()
             })
     }
 
@@ -4317,6 +4315,8 @@ extension TerminalView {
         public var bytesFed: Int = 0
         /// Calls to `feed`. Under a local process this is one per pty batch.
         public var batches: Int = 0
+        /// Times a feed released the terminal lock to another thread partway through its bytes.
+        public var feedHandoffs: Int = 0
         /// Display or immediate ticks delivered to the frame driver.
         public var ticks: Int = 0
         /// Ticks that produced a frame.

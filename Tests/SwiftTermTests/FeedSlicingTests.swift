@@ -31,6 +31,14 @@ final class FeedSlicingTests {
         }
     }
 
+    private final class ScrollCountingTerminal: Terminal {
+        var scrollNotifications = 0
+
+        override func scrollPositionChanged() {
+            scrollNotifications += 1
+        }
+    }
+
     private struct Unchecked<Value>: @unchecked Sendable {
         let value: Value
     }
@@ -388,4 +396,203 @@ final class FeedSlicingTests {
         }
     }
 
+#if os(macOS) || os(iOS) || os(visionOS) || os(macCatalyst)
+    private struct Session: @unchecked Sendable {
+        let owner: TerminalRenderOwner
+        let selection: SelectionService
+        let search: SearchService
+    }
+
+    private static func attach(_ terminal: Terminal) async -> Session {
+        let box = Unchecked(value: terminal)
+        return await MainActor.run {
+            let terminal = box.value
+            let owner = TerminalRenderOwner()
+            let selection = terminal.terminalLock.withLock { SelectionService(terminal: terminal) }
+            let search = SearchService(terminal: terminal)
+            owner.attach(terminal: terminal, selection: selection, search: search)
+            return Session(owner: owner, selection: selection, search: search)
+        }
+    }
+
+    @Test func aWaiterGetsTheLockBetweenHoldsOfOneLargeFeed() async {
+        let recorder = Recorder()
+        let terminal = Terminal(delegate: recorder, options: Self.options)
+        let owner = await Self.attach(terminal).owner
+        let bytes = Self.mixedSample(seed: 7, count: 150_000)
+        let holds = Locked(0)
+        let afterHolds = Locked(0)
+
+        let contention = Self.contended(terminal.terminalLock) {
+            let outcome = owner.feed(bytes: bytes[...]) {
+                afterHolds.withLock { $0 += 1 }
+            }
+            holds.withLock { $0 = outcome?.holds ?? 0 }
+        }
+
+        let worstMs = Double(contention.worstWaitNs) / 1_000_000
+        #expect(contention.acquisitions >= 10, "the waiter got in \(contention.acquisitions) times")
+        #expect(worstMs < 500, "worst wait \(worstMs) ms")
+        #expect(holds.withLock { $0 } > 1)
+        #expect(afterHolds.withLock { $0 } == holds.withLock { $0 })
+
+        let referenceRecorder = Recorder()
+        let reference = Terminal(delegate: referenceRecorder, options: Self.options)
+        reference.feed(buffer: bytes[...])
+        #expect(Self.fingerprint(terminal, recorder) == Self.fingerprint(reference, referenceRecorder))
+    }
+
+    @Test func anUncontendedFeedHoldsTheLockOnce() async {
+        let recorder = Recorder()
+        let terminal = Terminal(delegate: recorder, options: Self.options)
+        let owner = await Self.attach(terminal).owner
+        let bytes = Self.mixedSample(seed: 8, count: 50_000)
+        #expect(owner.feed(bytes: bytes[...])?.holds == 1)
+        #expect(owner.feed(text: "tail ✓")?.holds == 1)
+
+        let referenceRecorder = Recorder()
+        let reference = Terminal(delegate: referenceRecorder, options: Self.options)
+        reference.feed(buffer: bytes[...])
+        reference.feed(text: "tail ✓")
+        #expect(Self.fingerprint(terminal, recorder) == Self.fingerprint(reference, referenceRecorder))
+    }
+
+    @Test func anotherFeedNeverLandsInsideAFeed() async {
+        let terminal = Terminal(delegate: Recorder(), options: TerminalOptions(cols: 80, rows: 10, scrollback: 50_000))
+        let owner = await Self.attach(terminal).owner
+        Self.expectFeedsStayWhole(terminal) { bytes in
+            _ = owner.feed(bytes: bytes[...])
+        }
+    }
+
+    @Test func aHoldThatChangesTheSelectionClearsItBeforeTheFeedEnds() async {
+        for changesSelection in [false, true] {
+            let terminal = Terminal(delegate: Recorder(), options: Self.options)
+            let session = await Self.attach(terminal)
+            _ = session.owner.feed(text: "needle")
+            terminal.terminalLock.withLock {
+                session.selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 0))
+            }
+            let bytes = Self.selectionOverwrite(changesSelection) + Self.rowCounterWrites(count: Self.rowCounterCount)
+            let holds = Locked(0)
+            var clearedMidFeed = false
+            _ = Self.contended(terminal.terminalLock, feed: {
+                let outcome = session.owner.feed(bytes: bytes[...])
+                holds.withLock { $0 = outcome?.holds ?? 0 }
+            }) {
+                clearedMidFeed = clearedMidFeed || Self.isClearedMidFeed(terminal, session.selection)
+            }
+            #expect(holds.withLock { $0 } > 1)
+            #expect(clearedMidFeed == changesSelection)
+            #expect(terminal.terminalLock.withLock { session.selection.active } == !changesSelection)
+        }
+    }
+
+    @Test func eachHoldInvalidatesSearch() async {
+        let terminal = Terminal(delegate: Recorder(), options: Self.options)
+        let session = await Self.attach(terminal)
+        _ = session.owner.feed(text: "needle")
+        let bytes = Self.rowCounterWrites(count: Self.rowCounterCount)
+        var lastCounter = ""
+        var holdsSeen = 0
+        var staleResults = 0
+        var found = 0
+        _ = Self.contended(terminal.terminalLock, feed: { _ = session.owner.feed(bytes: bytes[...]) }) {
+            let counter = Self.row(terminal, 7)
+            if counter != lastCounter {
+                holdsSeen += 1
+                if session.search.lastResult != nil {
+                    staleResults += 1
+                }
+                lastCounter = counter
+            }
+            if session.search.findNext(term: "needle") != nil {
+                found += 1
+            }
+        }
+        #expect(holdsSeen >= 10)
+        #expect(found >= holdsSeen)
+        #expect(staleResults == 0)
+    }
+
+    @Test func eachHoldNotifiesAScrollOnce() async {
+        let terminal = ScrollCountingTerminal(delegate: Recorder(), options: Self.options)
+        let owner = await Self.attach(terminal).owner
+        let bytes = Array(String(repeating: String(repeating: "s", count: 30) + "\r\n", count: 20_000).utf8)
+        let box = Unchecked(value: terminal)
+        let notificationsPerHold = Locked<[Int]>([])
+        _ = Self.contended(terminal.terminalLock) {
+            var seen = 0
+            _ = owner.feed(bytes: bytes[...]) {
+                let total = box.value.scrollNotifications
+                notificationsPerHold.withLock { $0.append(total - seen) }
+                seen = total
+            }
+        }
+        let counts = notificationsPerHold.withLock { $0 }
+        #expect(counts.count > 1)
+        #expect(counts.allSatisfy { $0 == 1 }, "\(counts)")
+    }
+#endif
+
+#if os(macOS)
+    @MainActor
+    private static func frames(whileFeeding bytes: [UInt8], into view: TerminalView) async -> [[String]] {
+        let done = Locked(false)
+        let feeding = Unchecked(value: view)
+        Thread.detachNewThread {
+            feeding.value.feed(byteArray: bytes[...])
+            done.withLock { $0 = true }
+        }
+        var frames: [[String]] = []
+        while !done.withLock({ $0 }) {
+            view.frameTick()
+            frames.append(view.renderOwner.inspection().rowTexts)
+            if frames.count >= 20 {
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        return frames
+    }
+
+    @MainActor
+    private static func makeView() -> TerminalView {
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        view.feed(text: "before\r\n")
+        view.frameTick()
+        return view
+    }
+
+    private static func lines(_ count: Int) -> [UInt8] {
+        Array((0..<count).map { "line \($0) \u{1b}[1;3\($0 % 8)m colored\u{1b}[m\r\n" }.joined().utf8)
+    }
+
+    @MainActor
+    @Test func framesBetweenHoldsStayFrozenWhileSynchronizedOutputIsOpen() async {
+        let view = Self.makeView()
+        view.withTerminal { $0.synchronizedOutputTimeoutSeconds = 60 }
+        let before = view.renderOwner.inspection().rowTexts
+        let bytes = Array("\u{1b}[?2026h".utf8) + Self.lines(30_000) + Array("\u{1b}[?2026l".utf8)
+        let frames = await Self.frames(whileFeeding: bytes, into: view)
+        view.frameTick()
+        let after = view.renderOwner.inspection().rowTexts
+
+        #expect(view.diagnostics.feedHandoffs > 0)
+        #expect(frames.count >= 10)
+        #expect(before != after)
+        #expect(frames.allSatisfy { $0 == before || $0 == after })
+    }
+
+    @MainActor
+    @Test func framesBetweenHoldsShowALongFeedProgressing() async {
+        let view = Self.makeView()
+        let before = view.renderOwner.inspection().rowTexts
+        let frames = await Self.frames(whileFeeding: Self.lines(30_000), into: view)
+        view.frameTick()
+        let after = view.renderOwner.inspection().rowTexts
+
+        #expect(view.diagnostics.feedHandoffs > 0)
+        #expect(frames.contains { $0 != before && $0 != after })
+    }
+#endif
 }

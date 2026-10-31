@@ -188,29 +188,27 @@ private final class LocalProcessTerminalViewProcessAdapter:
     }
 
     func dataReceived(slice: ArraySlice<UInt8>) {
-        frameSignal.markDirty()
-        let parse = Profiling.begin(.ioParse, "bytes=%d", slice.count)
-        _ = renderOwner.feed(bytes: slice)
-        parse.end()
+        let signal = frameSignal
+        signal.markDirty()
+        let outcome = renderOwner.feed(bytes: slice, afterHold: signal.markDirty)
         diagnosticsState.withLock { diagnostics in
             diagnostics.bytesFed += slice.count
             diagnostics.batches += 1
+            diagnostics.feedHandoffs += outcome?.handoffs ?? 0
         }
         outputHandler.call()
-        frameSignal.markDirty()
     }
 
     func dataReceivedBorrowed(_ bytes: Span<UInt8>) {
-        frameSignal.markDirty()
-        let parse = Profiling.begin(.ioParse, "bytes=%d", bytes.count)
-        _ = renderOwner.feed(borrowedBytes: bytes)
-        parse.end()
+        let signal = frameSignal
+        signal.markDirty()
+        let outcome = renderOwner.feed(borrowedBytes: bytes, afterHold: signal.markDirty)
         diagnosticsState.withLock { diagnostics in
             diagnostics.bytesFed += bytes.count
             diagnostics.batches += 1
+            diagnostics.feedHandoffs += outcome?.handoffs ?? 0
         }
         outputHandler.call()
-        frameSignal.markDirty()
     }
 
     func getWindowSize() -> winsize {

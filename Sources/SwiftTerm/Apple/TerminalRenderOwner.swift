@@ -236,47 +236,54 @@ final class TerminalRenderOwner: Sendable {
         return try renderState.withLock(body)
     }
 
+    struct FeedOutcome {
+        let synchronizedOutputActive: Bool
+        let holds: Int
+
+        var handoffs: Int {
+            holds - 1
+        }
+    }
+
     /// Feeds one parser batch while this owner retains all mutable terminal
     /// services. The caller can wake the frame driver before and after this
     /// transaction without retaining a view.
-    func feed (bytes: ArraySlice<UInt8>) -> Bool? {
-        feedTransaction { terminal in
-            terminal.feed(buffer: bytes)
-        }
+    func feed (bytes: ArraySlice<UInt8>, afterHold: () -> Void = {}) -> FeedOutcome? {
+        feed(borrowedBytes: bytes.span, afterHold: afterHold)
     }
 
     /// Feeds one borrowed parser batch. The parse finishes before this method
     /// returns, so the caller can release the source storage after the call.
-    func feed(borrowedBytes: Span<UInt8>) -> Bool? {
-        feedTransaction { terminal in
-            terminal.feedBorrowed(borrowedBytes)
-        }
+    func feed(borrowedBytes bytes: Span<UInt8>, afterHold: () -> Void = {}) -> FeedOutcome? {
+        guard let session = currentSession() else { return nil }
+        let terminal = session.terminal
+        var active = false
+        let holds = terminal.feedInHolds(
+            bytes,
+            beginHold: { () -> SelectionService.SelectedContentSnapshot? in
+                session.search.invalidate()
+                return session.selection.captureSelectedContent()
+            },
+            endHold: { selectedContent in
+                if let selectedContent {
+                    session.selection.clearIfSelectedContentChanged(from: selectedContent)
+                }
+                return (
+                    active: terminal.synchronizedOutputActive,
+                    timeout: terminal.synchronizedOutputTimeoutSeconds,
+                    update: takePendingSynchronizedOutputWatchdogUpdate())
+            },
+            afterHold: { result in
+                applySynchronizedOutputWatchdogUpdate(result.update, timeout: result.timeout)
+                active = result.active
+                afterHold()
+            })
+        return FeedOutcome(synchronizedOutputActive: active, holds: holds)
     }
 
     /// Text variant of ``feed(bytes:)``.
-    func feed (text: String) -> Bool? {
-        feedTransaction { terminal in
-            terminal.feed(text: text)
-        }
-    }
-
-    private func feedTransaction(_ body: (Terminal) -> Void) -> Bool? {
-        guard let session = currentSession() else { return nil }
-        let terminal = session.terminal
-        let result = terminal.terminalLock.withLock {
-            session.search.invalidate()
-            let selectedContent = session.selection.captureSelectedContent()
-            body(terminal)
-            if let selectedContent {
-                session.selection.clearIfSelectedContentChanged(from: selectedContent)
-            }
-            return (
-                active: terminal.synchronizedOutputActive,
-                timeout: terminal.synchronizedOutputTimeoutSeconds,
-                update: takePendingSynchronizedOutputWatchdogUpdate())
-        }
-        applySynchronizedOutputWatchdogUpdate(result.update, timeout: result.timeout)
-        return result.active
+    func feed (text: String, afterHold: () -> Void = {}) -> FeedOutcome? {
+        feed(bytes: Array(text.utf8)[...], afterHold: afterHold)
     }
 
     /// Registers user input under the same owner and terminal locks as feed.
