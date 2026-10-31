@@ -7939,19 +7939,20 @@ open class Terminal {
      */
     public func parse (buffer: ArraySlice<UInt8>)
     {
-        parseDepth += 1
-        defer {
-            parseDepth -= 1
-            if parseDepth == 0 {
-                deliverPendingScrollNotification()
-                reconcileSynchronizedOutputWatchdog()
-            }
+        parsingBatch {
+            parser.parse(data: buffer, self)
         }
-        parser.parse(data: buffer, self)
     }
 
     /// Parses one borrowed batch and completes all parser effects before return.
     private func parseBorrowed(_ bytes: Span<UInt8>)
+    {
+        parsingBatch {
+            parser.parseBorrowed(bytes, self)
+        }
+    }
+
+    func parsingBatch(_ body: () -> Void)
     {
         parseDepth += 1
         defer {
@@ -7961,7 +7962,7 @@ open class Terminal {
                 reconcileSynchronizedOutputWatchdog()
             }
         }
-        parser.parseBorrowed(bytes, self)
+        body()
     }
 
     /// Records a scroll and delivers it immediately when no parse operation is
@@ -10406,6 +10407,10 @@ open class Terminal {
     var kittyClipboardClock: @Sendable () -> UInt64 = {
         TerminalEventTime.now().uptimeNanoseconds
     }
+#endif
+
+#if !SWIFTTERM_EMBEDDED && !os(WASI)
+    let feedState = TerminalFeedState()
 #endif
 }
 

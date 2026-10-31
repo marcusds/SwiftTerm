@@ -112,7 +112,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Stage A Thread Sanitizer Tests
-      run: swift test --no-parallel --sanitize=thread --filter "TerminalLocking|SynchronizedOutput|TerminalIOPipeline"
+      run: swift test --no-parallel --sanitize=thread --filter "TerminalLocking|SynchronizedOutput|TerminalIOPipeline|FeedSlicing"
 
   swiftpm-strict-concurrency:
 

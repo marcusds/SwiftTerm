@@ -22,13 +22,16 @@ import Foundation
 /// 3. Never enter the render domain while this lock is held. The render path
 ///    uses `RenderLoop.frameLock -> render state -> terminalLock`.
 /// 4. `send()` replies must not synchronously re-enter `Terminal`.
+/// 5. A feed takes the feed gate (`Terminal.feedState.gate`) before this lock;
+///    never take the gate while holding it.
 ///
 /// Acquisition is FIFO-fair. Fairness is a correctness requirement here, not a
 /// nicety: the parse thread runs `lock -> parse batch -> unlock -> lock` with no
 /// gap while the pty has data queued. Over a plain mutex it barges back in
 /// before the woken main thread is scheduled, and the main thread stalls for
 /// seconds even though every individual batch costs a couple of milliseconds.
-/// A ticket bounds the main thread's wait at one batch.
+/// A ticket bounds a non-feeding thread's wait at one hold; a feed waits on
+/// the feed gate for the whole of any feed already in progress.
 // The condition protects every mutable field. A thread can transfer this lock
 // to another concurrency domain, but only its lock operations expose state.
 public final class TerminalLock: @unchecked Sendable {
@@ -55,7 +58,15 @@ public final class TerminalLock: @unchecked Sendable {
         ObjectIdentifier(Thread.current)
     }
 
-    public init () {}
+    private let profiled: Bool
+
+    public init () {
+        profiled = true
+    }
+
+    init (profiled: Bool) {
+        self.profiled = profiled
+    }
 
     public func lock ()
     {
@@ -63,14 +74,15 @@ public final class TerminalLock: @unchecked Sendable {
         // Derived before taking `condition` so the tag lookup is never inside
         // the guarded region. Returns .other and does no work when profiling
         // is off.
-        let profilingOwner = Profiling.enabled ? ProfilingOwner.current : .other
+        let profiling = profiled && Profiling.enabled
+        let profilingOwner = profiling ? ProfilingOwner.current : .other
 
         condition.lock()
         precondition(owner != current, "TerminalLock is non-recursive")
         let ticket = nextTicket
         nextTicket &+= 1
         if ticket != nowServing {
-            let wait = Profiling.begin(.lockWait, owner: profilingOwner)
+            let wait = profiling ? Profiling.begin(.lockWait, owner: profilingOwner) : nil
             waiters += 1
             // Loop over `wait`: the release broadcasts, so every waiter wakes
             // and all but the ticket holder go back to sleep. This also covers
@@ -79,10 +91,10 @@ public final class TerminalLock: @unchecked Sendable {
                 condition.wait()
             } while ticket != nowServing
             waiters -= 1
-            wait.end()
+            wait?.end()
         }
         owner = current
-        if Profiling.enabled {
+        if profiling {
             holdInterval = Profiling.begin(.lockHold, owner: profilingOwner)
         }
         condition.unlock()
@@ -128,6 +140,12 @@ public final class TerminalLock: @unchecked Sendable {
         let locked = owner == currentOwner
         condition.unlock()
         return locked
+    }
+
+    var hasWaiters: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return waiters > 0
     }
 }
 

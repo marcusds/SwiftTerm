@@ -31,6 +31,10 @@ final class FeedSlicingTests {
         }
     }
 
+    private struct Unchecked<Value>: @unchecked Sendable {
+        let value: Value
+    }
+
     private static let samplePieces: [[UInt8]] = [
         "plain ascii text that runs long enough to wrap the forty columns ",
         "\u{1b}[1;31mred\u{1b}[0m ", "\u{1b}[38;5;208m256\u{1b}[39m ",
@@ -141,4 +145,247 @@ final class FeedSlicingTests {
             #expect(Self.parsed(chunks) == whole, "seed \(seed)")
         }
     }
+
+
+    @Test func pieceEndsNeverSplitAUTF8Scalar() {
+        let slicer = TerminalFeedSlicer()
+        let size = slicer.pieceBytes
+        for lead in 0..<4 {
+            for scalar in ["é", "漢", "👩", "\u{85}"] {
+                let bytes = Array(repeating: UInt8(ascii: "a"), count: size - lead)
+                    + Array(scalar.utf8) + Array(repeating: UInt8(ascii: "b"), count: 10)
+                let end = bytes.withUnsafeBufferPointer { buffer in
+                    slicer.pieceEnd(in: buffer.span, from: 0)
+                }
+                let scalarStart = size - lead
+                let scalarEnd = scalarStart + scalar.utf8.count
+                #expect(end == size || end == scalarStart || end == scalarEnd)
+                #expect(end <= size)
+                #expect(bytes[end] & 0xC0 != 0x80, "lead \(lead) \(scalar)")
+            }
+        }
+    }
+
+    @Test func pieceEndsTakeTheRestWhenItFitsAndTolerateBadUTF8() {
+        let slicer = TerminalFeedSlicer()
+        let short = Array(repeating: UInt8(0x41), count: slicer.pieceBytes)
+        short.withUnsafeBufferPointer { buffer in
+            #expect(slicer.pieceEnd(in: buffer.span, from: 0) == slicer.pieceBytes)
+            #expect(slicer.pieceEnd(in: buffer.span, from: 7) == slicer.pieceBytes)
+        }
+        let continuations = Array(repeating: UInt8(0x80), count: slicer.pieceBytes * 2)
+        continuations.withUnsafeBufferPointer { buffer in
+            #expect(slicer.pieceEnd(in: buffer.span, from: 0) == slicer.pieceBytes)
+            #expect(slicer.pieceEnd(in: buffer.span, from: 5) == slicer.pieceBytes + 5)
+        }
+    }
+
+    @Test func theFirstPieceOfAHoldFillsTheMinimumHold() {
+        let slicer = TerminalFeedSlicer()
+        let bytes = Array(repeating: UInt8(0x41), count: slicer.pieceBytes * 8)
+        let scale = Int(TerminalFeedSlicer.minimumHoldNs / TerminalFeedSlicer.pieceNs)
+        bytes.withUnsafeBufferPointer { buffer in
+            #expect(slicer.pieceEnd(in: buffer.span, from: 0, budgetNs: TerminalFeedSlicer.minimumHoldNs)
+                    == slicer.pieceBytes * scale)
+            #expect(slicer.pieceEnd(in: buffer.span, from: 0) == slicer.pieceBytes)
+        }
+    }
+
+    @Test func pieceSizeFollowsTheMeasuredRate() {
+        var slicer = TerminalFeedSlicer()
+        let start = slicer.pieceBytes
+        slicer.record(bytes: start, nanoseconds: TerminalFeedSlicer.pieceNs * 8)
+        #expect(slicer.pieceBytes == start / 8)
+
+        slicer.record(bytes: 10, nanoseconds: TerminalFeedSlicer.pieceNs * 1_000)
+        #expect(slicer.pieceBytes == start / 8, "a short piece is ignored")
+
+        slicer.record(bytes: slicer.pieceBytes, nanoseconds: 1)
+        #expect(slicer.pieceBytes == start / 8 * TerminalFeedSlicer.growthLimit)
+
+        for _ in 0..<10 {
+            slicer.record(bytes: slicer.pieceBytes, nanoseconds: 1)
+        }
+        #expect(slicer.pieceBytes == TerminalFeedSlicer.maximumPiece)
+
+        slicer.record(bytes: slicer.pieceBytes, nanoseconds: UInt64.max / 2)
+        #expect(slicer.pieceBytes == TerminalFeedSlicer.minimumPiece)
+    }
+
+    @Test func hasWaitersReportsAThreadBlockedOnTheLock() {
+        let lock = TerminalLock()
+        #expect(!lock.hasWaiters)
+        lock.lock()
+        #expect(!lock.hasWaiters)
+        let acquired = DispatchSemaphore(value: 0)
+        let box = Unchecked(value: lock)
+        DispatchQueue.global().async {
+            box.value.withLock {}
+            acquired.signal()
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while !lock.hasWaiters && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        #expect(lock.hasWaiters)
+        lock.unlock()
+        #expect(acquired.wait(timeout: .now() + 5) == .success)
+        #expect(!lock.hasWaiters)
+    }
+
+#if os(macOS) || os(Linux)
+    private static let threadSanitized = dlsym(dlopen(nil, RTLD_NOW), "__tsan_init") != nil
+
+    @Test(.disabled(if: threadSanitized, "an exit test's child process runs without TSan's interceptors"))
+    func aFeedUnderTheTerminalLockTrapsWhileAnotherFeedWaitsForIt() async {
+        let result = await #expect(processExitsWith: .failure, observing: [\.standardErrorContent]) {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5) { exit(0) }
+            let terminal = Terminal(delegate: FeedSlicingTests.Recorder(), options: FeedSlicingTests.options)
+            let selection = terminal.terminalLock.withLock { SelectionService(terminal: terminal) }
+            terminal.terminalLock.lock()
+            let box = FeedSlicingTests.Unchecked(value: (terminal, selection))
+            DispatchQueue.global().async {
+                box.value.0.feedPreservingSelection(Array("y".utf8)[...], selection: box.value.1)
+            }
+            while !terminal.terminalLock.hasWaiters {
+                usleep(1_000)
+            }
+            terminal.feedPreservingSelection(Array("x".utf8)[...], selection: selection)
+            exit(0)
+        }
+        let stderr = String(decoding: result?.standardErrorContent ?? [], as: UTF8.self)
+        #expect(stderr.contains("the feed gate or terminalLock"), "\(stderr)")
+    }
+
+    @Test(.disabled(if: threadSanitized, "an exit test's child process runs without TSan's interceptors"))
+    func aFeedFromInsideAFeedTrapsNamingTheFeedGate() async {
+        let result = await #expect(processExitsWith: .failure, observing: [\.standardErrorContent]) {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5) { exit(0) }
+            let terminal = Terminal(delegate: FeedSlicingTests.Recorder(), options: FeedSlicingTests.options)
+            _ = Array("x".utf8).withUnsafeBufferPointer { buffer in
+                terminal.feedInHolds(buffer.span, beginHold: {}, endHold: {}, afterHold: {
+                    terminal.feedInHolds(buffer.span, beginHold: {}, endHold: {}, afterHold: {})
+                })
+            }
+            exit(0)
+        }
+        let stderr = String(decoding: result?.standardErrorContent ?? [], as: UTF8.self)
+        #expect(stderr.contains("the feed gate or terminalLock"), "\(stderr)")
+    }
+#endif
+
+
+    private struct Contention {
+        var acquisitions = 0
+        var worstWaitNs: UInt64 = 0
+    }
+
+    private static func contended(
+        _ lock: TerminalLock,
+        feed: @escaping @Sendable () -> Void,
+        whileHeld: () -> Void = {}
+    ) -> Contention {
+        let started = DispatchSemaphore(value: 0)
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            started.signal()
+            feed()
+            done.signal()
+        }
+        started.wait()
+        var contention = Contention()
+        while done.wait(timeout: .now()) == .timedOut {
+            let begin = DispatchTime.now().uptimeNanoseconds
+            lock.withLock {
+                contention.worstWaitNs = max(contention.worstWaitNs, DispatchTime.now().uptimeNanoseconds - begin)
+                contention.acquisitions += 1
+                whileHeld()
+            }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        return contention
+    }
+
+    private static let rowCounterCount = 60_000
+
+    private static func rowCounterWrites(count: Int) -> [UInt8] {
+        var result: [UInt8] = []
+        for index in 0..<count {
+            result += Array("\u{1b}[8;1H\(index)".utf8)
+        }
+        return result
+    }
+
+    private static func row(_ terminal: Terminal, _ row: Int) -> String {
+        terminal.buffer.lines[terminal.buffer.yBase + row].translateToString(trimRight: true)
+    }
+
+    private static func selectionOverwrite(_ changesSelection: Bool) -> [UInt8] {
+        changesSelection ? Array("\u{1b}[1;1HNEEDLE".utf8) : []
+    }
+
+    private static func isClearedMidFeed(_ terminal: Terminal, _ selection: SelectionService) -> Bool {
+        !selection.active && row(terminal, 7) != "\(rowCounterCount - 1)"
+    }
+
+    @Test func theStandaloneFeedHandsTheLockToAWaiterAndChecksTheSelection() {
+        for changesSelection in [false, true] {
+            let terminal = Terminal(delegate: Recorder(), options: Self.options)
+            let selection = terminal.terminalLock.withLock {
+                terminal.feed(text: "needle")
+                let selection = SelectionService(terminal: terminal)
+                selection.setSelection(start: Position(col: 0, row: 0), end: Position(col: 6, row: 0))
+                return selection
+            }
+            let bytes = Self.selectionOverwrite(changesSelection) + Self.rowCounterWrites(count: Self.rowCounterCount)
+            let box = Unchecked(value: (terminal, selection))
+            var clearedMidFeed = false
+            let contention = Self.contended(terminal.terminalLock, feed: {
+                box.value.0.feedPreservingSelection(bytes[...], selection: box.value.1)
+            }) {
+                clearedMidFeed = clearedMidFeed || Self.isClearedMidFeed(terminal, selection)
+            }
+            #expect(contention.acquisitions >= 10, "the waiter got in \(contention.acquisitions) times")
+            #expect(clearedMidFeed == changesSelection)
+            #expect(terminal.terminalLock.withLock { selection.active } == !changesSelection)
+        }
+    }
+
+    @Test func anotherStandaloneFeedNeverLandsInsideAFeed() {
+        let terminal = Terminal(delegate: Recorder(), options: TerminalOptions(cols: 80, rows: 10, scrollback: 50_000))
+        let selection = terminal.terminalLock.withLock { SelectionService(terminal: terminal) }
+        let box = Unchecked(value: (terminal, selection))
+        Self.expectFeedsStayWhole(terminal) { bytes in
+            box.value.0.feedPreservingSelection(bytes[...], selection: box.value.1)
+        }
+    }
+
+    private static func expectFeedsStayWhole(_ terminal: Terminal, feed: @escaping @Sendable ([UInt8]) -> Void) {
+        let big = Array(String(repeating: String(repeating: "a", count: 70) + "\r\n", count: 5_000).utf8)
+        let started = DispatchSemaphore(value: 0)
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            started.signal()
+            feed(big)
+            done.signal()
+        }
+        started.wait()
+        Thread.sleep(forTimeInterval: 0.005)
+        feed(Array("\u{1b}[31mB\r\n".utf8))
+        #expect(done.wait(timeout: .now() + 60) == .success)
+
+        let rows = terminal.terminalLock.withLock {
+            (0..<terminal.buffer.lines.count).map {
+                terminal.buffer.lines[$0].translateToString(trimRight: true)
+            }
+        }
+        let b = rows.firstIndex { $0.contains("B") }
+        #expect(b.map { rows[$0] } == "B", "B landed inside a line of the other feed")
+        if let b {
+            let before = rows[..<b].contains { $0.hasPrefix("a") }
+            let after = rows[(b + 1)...].contains { $0.hasPrefix("a") }
+            #expect(!(before && after), "B landed inside the other feed")
+        }
+    }
+
 }

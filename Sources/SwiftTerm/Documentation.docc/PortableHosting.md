@@ -64,6 +64,12 @@ its damage only when no newer terminal change needs the same range. The WASM
 wrapper's generation acknowledgement provides that stronger stale-frame
 protection for browser hosts.
 
+On native builds ``Terminal/feedPreservingSelection(_:selection:)`` takes the
+terminal lock itself and may release it between pieces of a long feed, so a
+render under the lock can see a partly applied feed. A plain
+``Terminal/feed(buffer:)`` under the lock is not ordered against it and can
+land between those pieces.
+
 ## Rendering cells
 
 ``RenderSnapshotCell/text`` contains a complete grapheme cluster. Its width
