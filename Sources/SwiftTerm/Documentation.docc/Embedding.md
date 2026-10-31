@@ -87,7 +87,11 @@ do not register keyboard input or an OSC 133 semantic submission. Use
 
 ``TerminalView/feed(byteArray:)`` and ``TerminalView/send(data:)`` are callable
 from any thread. A host receiving input on an SSH or agent transport thread can
-call `send` directly with no marshalling.
+call `send` directly with no marshalling. Feeds from several threads are parsed
+one call at a time, in the order they arrive, so a feed waits for any feed
+already in progress to finish. A long feed may let a frame through between
+pieces; wrap an update that must appear at once, such as a whole screen, in
+synchronized output (`CSI ? 2026 h` ... `CSI ? 2026 l`).
 
 The one rule: do not call them from inside a terminal delegate callback. Those
 run with the terminal lock held and these methods take it; a precondition

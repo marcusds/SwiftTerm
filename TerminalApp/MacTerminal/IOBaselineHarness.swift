@@ -775,6 +775,7 @@ final class IOBaselineHarness {
         report += String(format: "| Throughput | %.1f MB/s |\n", mbPerSecond)
         report += "| Batches | \(diagnostics.batches) |\n"
         report += "| Mean batch | \(diagnostics.meanBatchBytes) bytes |\n"
+        report += "| Feed handoffs | \(diagnostics.feedHandoffs) |\n"
         report += String(format: "| Frames | %d (%.1f/s) |\n", diagnostics.frames, framesPerSecond)
         report += "| Renders (actually drawn) | \(diagnostics.renders) |\n"
         if diagnostics.renderLoopFrames > 0 {
@@ -936,6 +937,7 @@ final class IOBaselineHarness {
             "frame_refresh_total=\(number(frameRefresh?.totalMs ?? 0, digits: 1))",
             "io_parse_total=\(number(ioParse?.totalMs ?? 0, digits: 1))",
             "io_batch_total=\(number(ioBatch?.totalMs ?? 0, digits: 1))",
+            "feed_handoffs=\(diagnostics.feedHandoffs)",
             "stall_p99=\(number(stalls.p99Ms, digits: 2))",
             "stall_max=\(number(stalls.maxMs, digits: 2))"
         ]
