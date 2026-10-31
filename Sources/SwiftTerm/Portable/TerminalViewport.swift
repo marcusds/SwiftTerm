@@ -51,13 +51,23 @@ extension Terminal {
         }
     }
 
-    /// Feed-owner selection checks run once per batch, outside the parser.
+    /// Feed-owner selection checks run once per hold of the terminal lock, outside the parser.
     public func feedPreservingSelection(_ bytes: ArraySlice<UInt8>, selection: SelectionService) {
+#if !SWIFTTERM_EMBEDDED && !os(WASI)
+        feedInHolds(
+            bytes.span,
+            beginHold: { selection.captureSelectedContent() },
+            endHold: { previous in
+                if let previous { selection.clearIfSelectedContentChanged(from: previous) }
+            },
+            afterHold: { _ in })
+#else
         terminalLock.withLock {
             let previous = selection.captureSelectedContent()
             feed(buffer: bytes)
             if let previous { selection.clearIfSelectedContentChanged(from: previous) }
         }
+#endif
     }
 
     /// Pointer coordinates identify visible cells. Character ranges include
